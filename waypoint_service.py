@@ -1,23 +1,40 @@
 #!/usr/bin/env python3
+# waypoint_service.py
+
+"""
+Waypoint Navigation Service Node
+
+Provides a ROS2 service that stores and returns waypoint coordinates.
+This node does NOT execute motion - it only holds and shares the list of waypoints.
+"""
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Point
-
-# Import the generated service type (package name must match)
-# from your_package_name.srv import file_name (which has actual .srv extension)
 from waypoint_navigation.srv import GetWaypoints
 
-class WayPoints(Node):
 
+class WaypointNavigation(Node):
+    """
+    ROS2 Service Node that provides waypoint storage and retrieval.
+    
+    Service: 'waypoints' (GetWaypoints)
+    - Request: Empty (no fields required)
+    - Response: geometry_msgs/Point[] waypoints
+    """
+    
     def __init__(self):
-        super().__init__('waypoints_service')
-        # created_object_name = function(your .srv file, service_name, callback_function)
-        # service_name - what clients will use to call this service         # callback_function - function to process the request and send response
-        self.srv = self.create_service(GetWaypoints, 'waypoints', self.waypoint_callback)
-        self.get_logger().info('Waypoint Service ready. Call "waypoints" to receive the list.')
+        super().__init__('waypoint_navigation')
         
+        # Create service server
+        self.srv = self.create_service(
+            GetWaypoints,
+            'waypoints',
+            self.waypoint_callback
+        )
+        
+        # Define waypoint list (x, y, z coordinates in meters)
+        # These are the target positions for the drone to navigate to
         self.waypoints = [
             [-7.00, 0.00, 29.22],
             [-7.64, 3.06, 29.22],
@@ -28,44 +45,63 @@ class WayPoints(Node):
             [0.87, 8.18, 29.05],
             [3.93, 7.35, 29.05]
         ]
-        # If you want only first 5 for the task, slice here:
+        
+        # Optional: Limit waypoints for testing
         # self.waypoints = self.waypoints[:5]
-
+        
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('Waypoint Navigation Service Node Started')
+        self.get_logger().info(f'Service: "waypoints" (GetWaypoints)')
+        self.get_logger().info(f'Stored {len(self.waypoints)} waypoints')
+        self.get_logger().info('=' * 60)
+        
+        # Log all waypoints for debugging
+        for i, wp in enumerate(self.waypoints, 1):
+            self.get_logger().info(f'  Waypoint {i}: [{wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}]')
     
     def waypoint_callback(self, request, response):
-
-        if not self.waypoints:
-            self.get_logger().warn("Waypoint list is empty.")
-            return response  # return empty response immediately
+        """
+        Service callback that returns all stored waypoints.
         
-        response.waypoints = [Point(x=wp[0], y=wp[1], z=wp[2]) for wp in self.waypoints]
-        for i in range(len(self.waypoints)):
-            response.waypoints[i].x = self.waypoints[i][0]
-            response.waypoints[i].y = self.waypoints[i][1]
-            response.waypoints[i].z = self.waypoints[i][2]
-
-        self.get_logger().info("Incoming request for Waypoints")
+        Args:
+            request: GetWaypoints.Request (empty)
+            response: GetWaypoints.Response (contains waypoints array)
+            
+        Returns:
+            GetWaypoints.Response with populated waypoints array
+        """
+        if not self.waypoints:
+            self.get_logger().warn('Waypoint list is empty! Returning empty response.')
+            response.waypoints = []
+            return response
+        
+        # Convert waypoint list to geometry_msgs/Point array
+        response.waypoints = [
+            Point(x=float(wp[0]), y=float(wp[1]), z=float(wp[2]))
+            for wp in self.waypoints
+        ]
+        
+        self.get_logger().info(
+            f'Service request received. Returning {len(response.waypoints)} waypoints.'
+        )
+        
         return response
 
-def main(args=None):
-    rclpy.init(args=args)
-    node_waypoints = WayPoints()
 
+def main(args=None):
+    """Main entry point for waypoint navigation service node."""
+    rclpy.init(args=args)
+    
+    node = WaypointNavigation()
+    
     try:
-        rclpy.spin(node_waypoints)
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        node_waypoints.get_logger().info('KeyboardInterrupt, shutting down.\n')
+        node.get_logger().info('Keyboard interrupt received. Shutting down...')
     finally:
-        node_waypoints.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
-        
-
-# logs by Kale
-
-# [1]   Added values in waypoints
-# [2]   Made the main function better by understanding it
-# [3]   Added return response in else block
-# [4]   Added 'if' in waypoint_callback to check for empty waypoints list
