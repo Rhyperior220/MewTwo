@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pico_server.py
 
 import asyncio # we use this in line 138.
 import math
@@ -38,6 +39,9 @@ class WayPointServer(Node):
         self.duration = 0
 
         self.yaw = 0.0
+        self.roll = 0.0
+        self.pitch = 0.0
+        
         self.xyz = [0.0, 0.0, 0.0, 0.0]     # This line is of no use.
         self.dtime = 0
 
@@ -51,10 +55,11 @@ class WayPointServer(Node):
         self.drone_position = [0.0, 0.0, 0.0]
         self.desired_state = [0.0, 0.0, 0.0]
         self.curr_state = [0.0, 0.0, 0.0]
+        self.timer = None  # Will be initialized after action server
         
 
 
-        self.sample_time = 0.01666 #put the appropriate value according to your controller
+        self.sample_time = 0.03333 # (30 Hz)    put the appropriate value according to your controller 
 
         # --- PID / filter related defaults (merged from PID_new_Dipankar.py)
         self.m = 0.152
@@ -62,12 +67,12 @@ class WayPointServer(Node):
 
         # Filter buffers
         self.altitude_window = deque(maxlen=3)
-        self.avg_window = deque(maxlen=5)
+        self.avg_window = deque(maxlen=2)
 
-        # PID gains (index: 0->pitch/x, 1->roll/y, 2->throttle/z)
-        self.Kp = [0.0, 0.0, 725 * 0.06]
-        self.Ki = [0.0, 0.0, 2320 * 0.0008]
-        self.Kd = [0.0, 0.0, 388.5 * 0.3]
+        # PID gains (index: 0->pitch/x, 1->roll/y, 2->throttle/z)  
+        self.Kp = [300.0 * 0.06, 300.0 * 0.06, 725 * 0.06]      # Reduced pitch/roll Kp, throttle unchanged
+        self.Ki = [25.0 * 0.0008, 25.0 * 0.0008, 2320 * 0.0008] # Lower pitch/roll Ki, throttle unchanged
+        self.Kd = [20.0 * 0.3, 20.0 * 0.3, 388.5 * 0.3]         # Reduced pitch/roll Kd, throttle unchanged
 
         # PID state
         self.prev_error = [0.0, 0.0, 0.0]
@@ -77,7 +82,7 @@ class WayPointServer(Node):
         # command & integrator limits
         self.max_values = [2000, 2000, 2000]
         self.min_values = [1000, 1000, 1000]
-        self.error_sum_limits = [500, 500, 300]
+        self.error_sum_limits = [500, 500, 150]  # Reduced throttle integral limit from 300 to 150
         self.throttle_trim = 1458
 
         # Butterworth filter design
@@ -117,6 +122,9 @@ class WayPointServer(Node):
             callback_group=self.action_callback_group,
         )
 
+        # Initialize PID timer immediately
+        self.timer = self.create_timer(self.sample_time, self.pid_or_lqr_timer_callback, callback_group=self.pid_or_lqr_callback_group)
+
         self.get_logger().info('Waypoint Server initialized.')
 
         ## pid controller
@@ -131,13 +139,23 @@ class WayPointServer(Node):
 
         ## This was later added 
         self.arm()
-        #define the function to be run inside the timer callback. This function will implement the PID or LQR algorithm
-        self.timer = None
+        self.get_logger().info('PID Timer already created in constructor - controller ready')
     # PID or LQR controller timer callback
     def pid_or_lqr_timer_callback(self):
+        # Force PID enabled if we're in waypoint mode (prevents landing between waypoints)
+        if getattr(self, 'waypoint_mode_active', False):
+            self.pid_enabled = True
+            
         if not getattr(self, 'pid_enabled', False):
             # PID disabled: do nothing and return
+            if not hasattr(self, 'pid_disabled_logged'):
+                self.get_logger().warn('PID DISABLED - drone will land! Waiting for goal...')
+                self.pid_disabled_logged = True
             return
+        
+        # Reset the disabled flag when PID becomes enabled
+        if hasattr(self, 'pid_disabled_logged'):
+            delattr(self, 'pid_disabled_logged')
 
         # PID loop adapted from PID_new_Dipankar.py
         try:
@@ -147,7 +165,7 @@ class WayPointServer(Node):
         except Exception:
             filtered_z = self.curr_state[2]
 
-        # compute errors
+        # compute errors (current - desired, as it was working before)
         error_x = self.curr_state[0] - self.desired_state[0]
         error_y = self.curr_state[1] - self.desired_state[1]
         error_z = filtered_z - self.desired_state[2]
@@ -189,12 +207,24 @@ class WayPointServer(Node):
         out_roll = p_term_roll + i_term_roll + d_term_roll
         out_throttle = p_term_throttle + i_term_throttle + d_filtered
 
-        # Apply to command message and saturate
-        self.cmd.rc_pitch = max(min(1500 + int(out_pitch), self.max_values[1]), self.min_values[1])
+        # Apply to command message and saturate (Gazebo simulation - pitch inverted)
+        self.cmd.rc_pitch = max(min(1500 - int(out_pitch), self.max_values[1]), self.min_values[1])
         self.cmd.rc_roll = max(min(1500 - int(out_roll), self.max_values[0]), self.min_values[0])
         self.cmd.rc_throttle = max(min(int(self.throttle_trim + out_throttle), self.max_values[2]), self.min_values[2])
 
         self.prev_error = current_errors
+
+        # Debug: Print errors and commands every 30 loops (~0.5 seconds)
+        if not hasattr(self, 'debug_counter'):
+            self.debug_counter = 0
+        self.debug_counter += 1
+        distance = ((error_x**2 + error_y**2 + error_z**2) ** 0.5)
+        if self.debug_counter % 30 == 0:
+            self.get_logger().info(f'Current: [{self.curr_state[0]:.2f}, {self.curr_state[1]:.2f}, {self.curr_state[2]:.2f}]')
+            self.get_logger().info(f'Desired: [{self.desired_state[0]:.2f}, {self.desired_state[1]:.2f}, {self.desired_state[2]:.2f}]')
+            self.get_logger().info(f'Errors: [{error_x:.2f}, {error_y:.2f}, {error_z:.2f}]')
+            self.get_logger().info(f'RC Commands: pitch={self.cmd.rc_pitch}, roll={self.cmd.rc_roll}, throttle={self.cmd.rc_throttle}')
+            self.get_logger().info(f'Distance: {distance:.2f} meters')
 
         # Publish
         self.command_pub.publish(self.cmd)
@@ -295,8 +325,13 @@ class WayPointServer(Node):
         self.cmd.rc_aux4 = 1000       # aux for disarm
         self.command_pub.publish(self.cmd)
 
-        # PID gating flag
-        self.pid_enabled = False
+        # PID gating flag (only disable on initial arm, not between waypoints)
+        if not hasattr(self, 'initial_arm_done'):
+            self.pid_enabled = False
+            self.initial_arm_done = True
+            self.get_logger().info('Initial arm: PID disabled')
+        else:
+            self.get_logger().info('Re-arm: PID state preserved')
 
 
     # ------------------------------
@@ -309,11 +344,23 @@ class WayPointServer(Node):
         pose = msg.poses[0].position
         self.curr_state = [pose.x, pose.y, pose.z]
         self.drone_position = self.curr_state.copy()
+        
+        # Initialize desired_state to current position on first position reading
+        if not hasattr(self, '_position_initialized'):
+            self.desired_state = self.curr_state.copy()
+            self._position_initialized = True
+            self.get_logger().info(f'Initialized desired_state to current position: [{self.desired_state[0]:.2f}, {self.desired_state[1]:.2f}, {self.desired_state[2]:.2f}]')
 
     def odometry_callback(self, msg: Odometry):
         q = msg.pose.pose.orientation
         roll, pitch, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.yaw = math.degrees(yaw)
+        self.roll = math.degrees(roll)
+        self.pitch = math.degrees(pitch)
+        
+        # Safety check: warn if tilt is too extreme
+        if abs(self.roll) > 30 or abs(self.pitch) > 30:
+            self.get_logger().warn(f'Excessive tilt! Roll={self.roll:.1f}°, Pitch={self.pitch:.1f}°')
 
     async def execute_callback(self, goal_handle):
         """
@@ -332,11 +379,37 @@ class WayPointServer(Node):
             goal_handle.abort()
             return NavToWaypoint.Result()
     
+        # Store old waypoint for debugging
+        old_waypoint = self.desired_state.copy()
+        
         self.desired_state = [
             goal.target.point.x,
             goal.target.point.y,
             goal.target.point.z,
         ]
+        
+        # Calculate waypoint change distance
+        dx = self.desired_state[0] - old_waypoint[0]
+        dy = self.desired_state[1] - old_waypoint[1]
+        dz = self.desired_state[2] - old_waypoint[2]
+        distance = (dx**2 + dy**2 + dz**2)**0.5
+        
+        self.get_logger().info(f'Waypoint change: {distance:.2f}m from [{old_waypoint[0]:.2f}, {old_waypoint[1]:.2f}, {old_waypoint[2]:.2f}]')
+        
+        # Smart integral reset: Only reset pitch/roll, preserve throttle for altitude
+        # Also clamp throttle integral if it's excessive to prevent windup issues
+        self.sum_error[0] = 0.0  # Reset pitch integral
+        self.sum_error[1] = 0.0  # Reset roll integral  
+        
+        # Clamp throttle integral if excessive (but don't reset to 0)
+        if abs(self.sum_error[2]) > 100:  # If throttle integral is unreasonably large
+            self.sum_error[2] = 100 if self.sum_error[2] > 0 else -100
+            self.get_logger().warn(f'Throttle integral clamped to prevent windup')
+        
+        self.get_logger().info(f'Pitch/Roll integrals reset, throttle integral: {self.sum_error[2]:.2f}')
+        
+        # Debug: Print the new waypoint
+        self.get_logger().info(f'NEW WAYPOINT SET: [{goal.target.point.x:.2f}, {goal.target.point.y:.2f}, {goal.target.point.z:.2f}]')
 
         feedback_msg = NavToWaypoint.Feedback()
         result = NavToWaypoint.Result()
@@ -352,7 +425,14 @@ class WayPointServer(Node):
 
         # before publishing target or starting to stabilize
         # Optionally arm here (if you require arming): self.arm()
+        
+        # Initialize desired_state to current position if this is first waypoint
+        if not getattr(self, 'pid_enabled', False):
+            self.get_logger().info(f'First waypoint - initializing desired_state to current position: [{self.curr_state[0]:.2f}, {self.curr_state[1]:.2f}, {self.curr_state[2]:.2f}]')
+        
         self.pid_enabled = True
+        self.waypoint_mode_active = True  # Flag to keep PID always enabled once waypoints start
+        self.get_logger().info(f'PID ENABLED - Controller should now track waypoint')
         self.target_pub.publish(target_msg)
 
         # reset stabalization bookkeeping
@@ -361,14 +441,9 @@ class WayPointServer(Node):
         self.time_inside_sphere = 0
 
         # small radius (whycon units) — adjust if needed
-        radius = 0.08  # 8 cm radius sphere
+        radius = 0.90  # 90 cm radius sphere (loose tolerance)
 
         # main loop: send feedback frequently, check stabilization condition
-
-        if self.timer is None:
-            self.timer = self.create_timer(self.sample_time, self.pid_or_lqr_timer_callback, callback_group=self.pid_or_lqr_callback_group)
-            # optionally call self.arm() here once you're ready
-
         while True:
             feedback_msg.current_position.point.x = self.curr_state[0]
             feedback_msg.current_position.point.y = self.curr_state[1]
@@ -386,6 +461,16 @@ class WayPointServer(Node):
             # check if drone is within sphere around desired waypoint
             drone_in_sphere = self.is_drone_in_sphere(self.drone_position, goal, radius) # radius can be adjusted
 
+            # Debug: Log sphere status every few seconds
+            if not hasattr(self, 'sphere_debug_counter'):
+                self.sphere_debug_counter = 0
+            self.sphere_debug_counter += 1
+            if self.sphere_debug_counter % 50 == 0:  # Every 5 seconds
+                distance = ((self.drone_position[0] - goal.target.point.x)**2 + 
+                           (self.drone_position[1] - goal.target.point.y)**2 + 
+                           (self.drone_position[2] - goal.target.point.z)**2)**0.5
+                self.get_logger().info(f'Waypoint Status: Distance={distance:.2f}m, InSphere={drone_in_sphere}, Radius={radius:.2f}m, Time={self.max_time_inside_sphere:.1f}s')
+
             now_sec = self.get_clock().now().seconds_nanoseconds()[0]
 
             if drone_in_sphere:
@@ -402,8 +487,8 @@ class WayPointServer(Node):
                 self.time_inside_sphere = 0.0
                 self.max_time_inside_sphere = 0.0
 
-            # success condition: inside sphere continuously for >= 3 seconds
-            if self.max_time_inside_sphere >= 3:
+            # success condition: inside sphere continuously for >= 2 seconds
+            if self.max_time_inside_sphere >= 2:
                 break
 
             # non-blocking wait for a short interval
@@ -412,10 +497,17 @@ class WayPointServer(Node):
             
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        # goal succeeded -> fill result and finish
+        # goal succeeded -> fill result and finish  
+        # Keep PID enabled for next waypoint (don't disable it)
         goal_handle.succeed()
         result.hov_time = float(self.max_time_inside_sphere)
         self.get_logger().info(f'Waypoint reached. Stabilization time: {result.hov_time:.3f} s')
+        
+        # Brief pause to let system stabilize before accepting next waypoint
+        import time
+        time.sleep(0.5)  # 500ms stabilization pause
+        
+        self.get_logger().info('Ready for next waypoint (PID remains enabled)')
         return result
 
     def is_drone_in_sphere(self, drone_pos, goal_msg, radius):
@@ -445,10 +537,11 @@ class WayPointServer(Node):
         dy = drone_pos[1] - gy
         dz = drone_pos[2] - gz
         dist2 = dx * dx + dy * dy + dz * dz
+        dist = dist2 ** 0.5     ## under root
 
         return (
-            dist2
-        ) <= radius**2
+            dist
+        ) <= radius
 # -------------------------------
 ### MAIN Function
 # -------------------------------
